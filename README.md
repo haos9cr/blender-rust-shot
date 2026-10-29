@@ -16,6 +16,36 @@ camera moves in Blender — paths, constraints, easing, focus pulls — and expo
 > Unofficial fan tool. Not affiliated with or endorsed by Facepunch Studios.
 > The `.shot` format was reverse-engineered and may change with game updates.
 
+## Pairs well with blender-rust-toolkit
+
+Animating blind is hard. [**blender-rust-toolkit**](https://github.com/haos9cr/blender-rust-toolkit) loads a Rust map
+and its assets into Blender, so you can see the terrain, monuments and buildings while you animate the camera:
+fly through doorways, skim rooftops, frame a base without clipping into rocks.
+
+## Example
+
+[![Rust Shot example: camera fly-through animated in Blender, played back in Rust](https://img.youtube.com/vi/hBKVEP4vYPI/hqdefault.jpg)](https://www.youtube.com/watch?v=hBKVEP4vYPI)
+
+*Click the image to watch the video on YouTube.*
+
+The scene from the video is in [`examples/`](examples):
+
+| File | What it is |
+|---|---|
+| [`advanced_camera_animation.blend`](examples/advanced_camera_animation.blend) | The animated camera, terrain, roads and the moving entities of the demo. Game models are not included |
+| [`proceduralmap.2000.1791947167831.289_20a7932af0530ee6cc900c8d7492d632_2687766392.map`](examples/proceduralmap.2000.1791947167831.289_20a7932af0530ee6cc900c8d7492d632_2687766392.map) | The map the shot was made on |
+
+How the camera is set up: it follows the helper cube **CAMERA_POS** (Copy Location) and looks at the cube **TARGET** (Track To).
+You only animate the two cubes, and the camera stays level and always aims at the subject.
+
+To see it with the full map:
+1. Install **Rust Shot** and [blender-rust-toolkit](https://github.com/haos9cr/blender-rust-toolkit).
+2. Open `advanced_camera_animation.blend`.
+3. Load the `.map` from `examples/` with blender-rust-toolkit. Monuments and props come from your own Rust installation.
+4. Press Play, then export the camera with the **Rust Shot** panel.
+
+The demo file itself is not included. The shot lines up only with a demo recorded on this map.
+
 ## Install
 
 1. Download `rust_shot.py`.
@@ -107,7 +137,7 @@ confirmed to play back in game. Record your own shots with the debug camera and 
 
 - Field 12 of the file is not understood. It is always the same small block, so it is copied unchanged.
 - The game records the focus distance already smoothed. It is not known whether playback smooths it again.
-- Only the debug camera shot format is covered. Loading the map or the demo itself is a separate project.
+- Only the debug camera shot format is covered. Loading the map is done by [blender-rust-toolkit](https://github.com/haos9cr/blender-rust-toolkit).
 
 ## License
 

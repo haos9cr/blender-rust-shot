@@ -7,3 +7,6 @@ backup/
 .idea/
 Thumbs.db
 desktop.ini
+
+# originals with game assets / personal data stay local
+samples/*.blend
