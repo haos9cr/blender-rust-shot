@@ -4,23 +4,31 @@
 
 Animate camera fly-throughs for **Rust** demos in Blender and play them back in the game.
 
-In-game, the demo debug camera can only be flown by hand (WASD + mouse) and recorded into a
-`.shot` file. This add-on reads and writes that file format, so you can build smooth, precise
-camera moves in Blender — paths, constraints, easing, focus pulls — and export them back to the game.
+In game, the demo camera can only be flown by hand (WASD + mouse). This add-on reads and writes the
+game's camera files, so you can build smooth, precise camera moves in Blender (paths, constraints,
+easing, focus pulls) and export them back to the game.
 
-- Import any `.shot` as an animated Blender camera (position, rotation, FOV, depth of field)
-- Export any camera animation to a `.shot` the game plays back
-- Byte-exact re-encode of every in-game recording tested so far
+Two formats are supported:
+
+| Format | Game version | What it holds |
+|---|---|---|
+| **Demo controls** `demos/controls/<demo>.demo-controls.json` | current (staging, Oct 2026+) | Scenes with a camera path plus animated **time of day, sun, weather, clouds, fog, wind, FOV, focal length, DOF and effects** |
+| **Shot** `.shot` (legacy) | older versions | Camera position, rotation, FOV, DOF |
+
+- Import a scene or shot as an animated Blender camera; every game control becomes an animatable value
+- Export back into the same controls file; other scenes, clones, lights and settings in it are kept
+- The game's files are written exactly as the game writes them (verified byte-for-byte)
 - Works without Blender too: a small CLI converts `.shot` ⇄ JSON
 
 > Unofficial fan tool. Not affiliated with or endorsed by Facepunch Studios.
-> The `.shot` format was reverse-engineered and may change with game updates.
+> The file formats were reverse-engineered and may change with game updates.
 
-## Pairs well with blender-rust-toolkit
+## Optional: blender-rust-toolkit
 
-Animating blind is hard. [**blender-rust-toolkit**](https://github.com/haos9cr/blender-rust-toolkit) loads a Rust map
+[**blender-rust-toolkit**](https://github.com/haos9cr/blender-rust-toolkit) loads a Rust map
 and its assets into Blender, so you can see the terrain, monuments and buildings while you animate the camera:
 fly through doorways, skim rooftops, frame a base without clipping into rocks.
+Rust Shot works fine without it; the toolkit just makes it easier to see where the camera goes.
 
 ## Example
 
@@ -38,11 +46,12 @@ The scene from the video is in [`examples/`](examples):
 How the camera is set up: it follows the helper cube **CAMERA_POS** (Copy Location) and looks at the cube **TARGET** (Track To).
 You only animate the two cubes, and the camera stays level and always aims at the subject.
 
-To see it with the full map:
-1. Install **Rust Shot** and [blender-rust-toolkit](https://github.com/haos9cr/blender-rust-toolkit).
-2. Open `advanced_camera_animation.blend`.
-3. Load the `.map` from `examples/` with blender-rust-toolkit. Monuments and props come from your own Rust installation.
-4. Press Play, then export the camera with the **Rust Shot** panel.
+To try it:
+1. Install **Rust Shot** and open `advanced_camera_animation.blend`.
+2. Press Play, then export the camera with the **Rust Shot** panel.
+
+Loading the map is optional, just for convenience: with [blender-rust-toolkit](https://github.com/haos9cr/blender-rust-toolkit)
+you can load the `.map` from `examples/` and see monuments and props around the camera (they come from your own Rust installation).
 
 The demo file itself is not included. The shot lines up only with a demo recorded on this map.
 
@@ -55,6 +64,40 @@ The demo file itself is not included. The shot lines up only with a demo recorde
 Tested on Blender 5.2. The code targets 3.0+ (including the layered Action API of 4.4+/5.x).
 
 ## Usage
+
+### Demo controls (current Rust)
+
+The game keeps one controls file per demo in `RustStaging\demos\controls\` (or `Rust\demos\controls\`).
+Each file can hold several scenes.
+
+**Import:** Rust Shot panel → **Import controls** (or **File → Import → Rust demo controls**). Choose the active
+scene or all scenes; each scene becomes a camera. With the camera selected, the panel shows:
+
+- **File / Scene** — where it is exported to. An existing scene with this name is replaced, a new name adds a scene.
+- **Camera:** FOV, focus distance (or a **Focus Object**), aperture — these are the Blender camera's own settings.
+- **Camera / Depth of field / Environment / Effects:** every other game control (focal length, roll, shake,
+  DOF blur, time of day, sun rotation, weather, clouds, fog, wind, bloom, motion blur, vignette, ...).
+  Hover a value and press **I** to keyframe it. **Add control** adds any control the scene does not have yet.
+
+Times are seconds on the demo timeline: the first frame of the range is demo time **Demo time at start** (0 by default).
+
+**Export:** set **Format: Demo controls**, then **Export to controls file** (or **File → Export → Rust demo controls**).
+
+| Setting | What it does |
+|---|---|
+| **Path keys / sec** | Camera path keys per second. The game smooths the path between keys, so 5–10 is plenty |
+| **Tracks: Keyframes** | Your keyframes go to the game as they are and stay editable there. Blender interpolation becomes the key's tangent mode: Bezier auto = Smooth, aligned horizontal handles = Flat, Linear = Linear, Constant = Step, free handles = Broken |
+| **Tracks: Bake** | Samples every animated value at **Bake keys / sec**: exact curve shape, any Blender interpolation |
+| **Make it the active scene** | Sets the file's active scene to the exported one |
+| **Backup before overwrite** | Copies the existing file into a `backup` folder next to it first |
+
+Constant (step) keys are written with an extra key just before the jump, so steps stay steps even if the game
+smooths the curve. On/off controls such as DOF enabled are always exported as steps.
+Weather values: 0 Clear, 1 Overcast, 2 Rain, 3 Storm, 4 Snow.
+
+### Legacy shot (.shot)
+
+The settings below (and **Format: Legacy shot**) apply to `.shot` files of older game versions.
 
 ### Import
 **Rust Shot panel → Import Rust shot** (or **File → Import → Rust camera shot**).
@@ -135,7 +178,9 @@ confirmed to play back in game. Record your own shots with the debug camera and 
 
 ## Known limitations
 
-- Field 12 of the file is not understood. It is always the same small block, so it is copied unchanged.
+- Demo controls: staging currently loads every key back as Smooth, even though it saves the tangent mode.
+  Use **Tracks: Bake** if the exact curve shape matters. Clones and lights are kept but not edited yet.
+- `.shot`: field 12 is not understood. It is always the same small block, so it is copied unchanged.
 - The game records the focus distance already smoothed. It is not known whether playback smooths it again.
 - Only the debug camera shot format is covered. Loading the map is done by [blender-rust-toolkit](https://github.com/haos9cr/blender-rust-toolkit).
 

@@ -1,7 +1,14 @@
 """
-Rust demo camera shot (.shot) codec + Blender import/export add-on.
+Rust demo camera: Blender import/export add-on.
 
-Format (reverse-engineered, protobuf):
+Two formats:
+  * Demo controls  demos/controls/<demo>.demo-controls.json   (Rust staging, Oct 2026 and later)
+      Plain JSON. Scenes with a camera path, animated tracks (time of day, weather, fog, DOF, FOV, effects...)
+      and base values. Imported as an animated camera with custom properties; exported back into the same
+      file (other scenes, clones, lights and export range are kept).
+  * Legacy shot    .shot (protobuf, older game versions), format below.
+
+Legacy .shot format (reverse-engineered, protobuf):
   ShotFile
     1  string  name                 ("test_1_000_000")
     2  string  demo path            ("demos/xxx.dem")
@@ -25,13 +32,9 @@ CLI (no Blender needed):
   python rust_shot.py roundtrip in.shot          # checks byte-exact re-encode
 
 Blender: Edit > Preferences > Add-ons > Install... > pick this file.
-  3D View > N sidebar > "Rust Shot" tab: import, per-camera settings (demo, start, folder, DOF),
-  export settings, quick export to a shots folder, FPS tools.
-  File > Import / Export > Rust camera shot (.shot) also work (same settings).
-  Timing: seconds = (frame - range start) / FPS / speed. If the scene FPS is changed after
-  animating, the panel warns and "Rescale keys" restores the original real-time speed.
-  DOF: focus distance <- dof.focus_distance (or distance to dof.focus_object),
-       aper <- dof.aperture_fstop, blur <- camera "DOF blur" (animatable).
+  3D View > N sidebar > "Rust Shot" tab: import, per-camera settings, export settings, FPS tools.
+  File > Import / Export > Rust demo controls (.json) / Rust camera shot (.shot).
+  Timing: seconds = (frame - range start) / FPS / speed (+ "Demo time at start" for controls).
 """
 
 import json
@@ -42,10 +45,10 @@ import sys
 bl_info = {
     "name": "Rust camera shot (.shot)",
     "author": "haos9cr",
-    "version": (0, 3, 1),
+    "version": (0, 4, 0),
     "blender": (3, 0, 0),
     "location": "File > Import/Export",
-    "description": "Import/export Rust demo debug-camera shots",
+    "description": "Import/export Rust demo camera paths and controls (.demo-controls.json, .shot)",
     "category": "Import-Export",
 }
 
@@ -284,6 +287,151 @@ def blender_to_unity(loc, rotmat):
     return (x, z, y), mat_to_quat(_swap_rows_cols(rotmat))
 
 
+# ---------------------------------------------------------------- demo controls (.demo-controls.json)
+# Rust staging, Oct 2026: demos/controls/<demo>.demo-controls.json, plain JSON written by Json.NET.
+#   { Version, CurrentSceneId, Scenes: [ { Id, Name, Data: {
+#       Version, Properties: [{Id, Value}], Tracks: [{Id, Keyframes: [{Time, Value, Easing}]}],
+#       CameraPath: {Algorithm, Transform: [{Time, Px, Py, Pz, Qx, Qy, Qz, Qw, Focal}]},
+#       Clones: [], Lights: [], HasExportRange, ExportStart, ExportEnd } } ] }
+# Times are seconds on the demo timeline. Positions/rotations are Unity world space (same as .shot).
+
+# Easing = tangent mode of a key, in the order of the in-game "Tangents" buttons.
+# (The game writes it, but staging currently loads every key back as Smooth.)
+EASING_NAMES = ["SMOOTH", "FLAT", "LINEAR", "STEP", "BROKEN"]
+WEATHER_NAMES = ["Clear", "Overcast", "Rain", "Storm", "Snow"]
+
+# id: (label, default, min, max, kind)   kind: float | int | bool | weather
+CONTROL_INFO = {
+    "camera.fov":            ("FOV", 90.0, 1.0, 179.0, "float"),
+    "camera.focallength":    ("Focal length", 50.0, 1.0, 1000.0, "float"),
+    "camera.focusdistance":  ("Focus distance", 10.0, 0.0, 10000.0, "float"),
+    "camera.aperture":       ("Aperture", 16.0, 0.1, 128.0, "float"),
+    "camera.dofblur":        ("DOF blur", 16.0, 0.0, 100.0, "float"),
+    "camera.roll":           ("Roll", 0.0, -360.0, 360.0, "float"),
+    "camera.cinematicshake": ("Cinematic shake", 0.0, 0.0, 10.0, "float"),
+    "dof.enabled":           ("DOF enabled", 0.0, 0.0, 1.0, "bool"),
+    "dof.mode":              ("DOF mode", 0.0, 0.0, 10.0, "int"),
+    "dof.quality":           ("DOF quality", 0.0, 0.0, 10.0, "int"),
+    "dof.focustime":         ("Focus time", 0.2, 0.0, 10.0, "float"),
+    "dof.barrel":            ("Barrel", 0.0, -10.0, 10.0, "float"),
+    "dof.squeeze":           ("Squeeze", 0.0, -10.0, 10.0, "float"),
+    "dof.debug":             ("DOF debug", 0.0, 0.0, 1.0, "bool"),
+    "env.timeofday":         ("Time of day", 12.0, 0.0, 24.0, "float"),
+    "env.sunrotation":       ("Sun rotation", 0.0, 0.0, 360.0, "float"),
+    "env.weather":           ("Weather", 0.0, 0.0, 4.0, "weather"),
+    "env.clouds":            ("Clouds", 0.0, 0.0, 1.0, "float"),
+    "env.fog":               ("Fog", 0.0, 0.0, 1.0, "float"),
+    "env.wind":              ("Wind", 0.0, 0.0, 1.0, "float"),
+    "fx.ao":                 ("Ambient occlusion", 1.0, 0.0, 1.0, "float"),
+    "fx.bloom":              ("Bloom", 1.0, 0.0, 1.0, "float"),
+    "fx.chromatic":          ("Chromatic aberration", 0.0, 0.0, 1.0, "float"),
+    "fx.filmgrain":          ("Film grain", 0.0, 0.0, 1.0, "float"),
+    "fx.lensdirt":           ("Lens dirt", 0.0, 0.0, 1.0, "float"),
+    "fx.motionblur":         ("Motion blur", 1.0, 0.0, 1.0, "float"),
+    "fx.screenvignette":     ("Screen vignette", 0.0, 0.0, 1.0, "float"),
+    "fx.shafts":             ("Sun shafts", 0.0, 0.0, 1.0, "float"),
+    "fx.sharpen":            ("Sharpen", 1.0, 0.0, 1.0, "float"),
+    "fx.vignette":           ("Vignette", 0.0, 0.0, 1.0, "float"),
+}
+CONTROL_GROUPS = [("camera", "Camera"), ("dof", "Depth of field"), ("env", "Environment"), ("fx", "Effects")]
+
+
+def _f32_text(v):
+    """float32 as .NET 'R' writes it (G7, or G9 if G7 does not round-trip) + Json.NET's '.0'."""
+    v = float(v)
+    if v != v or v in (float("inf"), float("-inf")):
+        v = 0.0
+    want = struct.pack("<f", v)
+    t = "%.7g" % v
+    if struct.pack("<f", float(t)) != want:
+        t = "%.9g" % v
+    if "e" in t:
+        m, e = t.split("e")
+        t = "%sE%s%02d" % (m, "-" if e[0] == "-" else "+", int(e.lstrip("+-")))
+    elif "." not in t:
+        t += ".0"
+    return t
+
+
+def _json_text(o, ind=0):
+    sp = "  "
+    if isinstance(o, dict):
+        if not o:
+            return "{}"
+        body = ",\r\n".join('%s%s: %s' % (sp * (ind + 1), json.dumps(k, ensure_ascii=False), _json_text(v, ind + 1))
+                            for k, v in o.items())
+        return "{\r\n" + body + "\r\n" + sp * ind + "}"
+    if isinstance(o, list):
+        if not o:
+            return "[]"
+        body = ",\r\n".join(sp * (ind + 1) + _json_text(v, ind + 1) for v in o)
+        return "[\r\n" + body + "\r\n" + sp * ind + "]"
+    if isinstance(o, bool):
+        return "true" if o else "false"
+    if isinstance(o, int):
+        return str(o)
+    if isinstance(o, float):
+        return _f32_text(o)
+    if o is None:
+        return "null"
+    return json.dumps(o, ensure_ascii=False)
+
+
+def controls_load(path):
+    with open(path, "r", encoding="utf-8-sig") as fh:
+        return json.load(fh)
+
+
+def controls_text(data):
+    return _json_text(data)
+
+
+def controls_save(data, path, backup_dir=None):
+    """Write like the game does. If the file exists and backup_dir is given, keep a timestamped copy first."""
+    import os
+    import shutil
+    import time
+    if backup_dir and os.path.exists(path):
+        os.makedirs(backup_dir, exist_ok=True)
+        base = os.path.basename(path)
+        stamp = time.strftime("%Y-%m-%d_%H%M%S")
+        dst = os.path.join(backup_dir, "%s.%s.bak" % (base, stamp))
+        n = 1
+        while os.path.exists(dst):
+            n += 1
+            dst = os.path.join(backup_dir, "%s.%s_%d.bak" % (base, stamp, n))
+        shutil.copy2(path, dst)
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write(controls_text(data))
+
+
+def controls_new_file():
+    return {"Version": 2, "CurrentSceneId": "", "Scenes": []}
+
+
+def controls_new_scene(name, end_time=0.0):
+    import uuid
+    return {"Id": uuid.uuid4().hex, "Name": name, "Data": {
+        "Version": 2, "Properties": [], "Tracks": [],
+        "CameraPath": {"Algorithm": 1, "Transform": []},
+        "Clones": [], "Lights": [],
+        "HasExportRange": False, "ExportStart": 0.0, "ExportEnd": float(end_time)}}
+
+
+def controls_find_scene(data, name=None, scene_id=None):
+    for sc in data.get("Scenes", []):
+        if scene_id and sc.get("Id") == scene_id:
+            return sc
+    for sc in data.get("Scenes", []):
+        if name is not None and sc.get("Name") == name:
+            return sc
+    return None
+
+
+def controls_current_scene(data):
+    return controls_find_scene(data, scene_id=data.get("CurrentSceneId")) or (data.get("Scenes") or [None])[0]
+
+
 # ---------------------------------------------------------------- Blender add-on
 
 try:
@@ -349,6 +497,15 @@ if HAVE_BPY:
         dof_blur: FloatProperty(name="DOF blur", default=16.0, min=0.0,
                                 description="graphics.dof_blur (animatable)")
         raw: StringProperty(options={"HIDDEN"})
+        # demo controls (.demo-controls.json)
+        controls_file: StringProperty(name="Controls file", subtype="FILE_PATH",
+                                      description="demos/controls/<demo>.demo-controls.json in the game folder")
+        scene_name: StringProperty(name="Scene", description="Scene name inside the controls file "
+                                                              "(an existing scene with this name is replaced)")
+        scene_id: StringProperty(options={"HIDDEN"})
+        path_algorithm: IntProperty(name="Path algorithm", default=1, options={"HIDDEN"})
+        path_focal: FloatProperty(name="Path focal", default=50.0, options={"HIDDEN"})
+        controls: StringProperty(options={"HIDDEN"}, description="JSON list of control ids on this camera")
 
     class RustShotExport(bpy.types.PropertyGroup):
         """Scene-wide export settings."""
@@ -402,6 +559,26 @@ if HAVE_BPY:
         file_name: StringProperty(name="File name", description="Empty = camera name")
 
         authored_fps: FloatProperty(options={"HIDDEN"}, default=0.0)
+
+        fmt: EnumProperty(
+            name="Format",
+            items=[("CONTROLS", "Demo controls (.json)", "demos/controls/<demo>.demo-controls.json (current Rust)"),
+                   ("SHOT", "Legacy shot (.shot)", "Old debug-camera shot files")],
+            default="CONTROLS")
+        path_rate: FloatProperty(name="Path keys / sec", default=10.0, min=0.5, max=120.0,
+                                 description="Camera path keys per second. The game smooths the path between keys, "
+                                             "so a few per second is enough")
+        track_mode: EnumProperty(
+            name="Tracks",
+            items=[("KEYS", "Keyframes", "Write your keyframes as they are (editable in game). "
+                                         "Interpolation becomes the key's tangent mode"),
+                   ("BAKE", "Bake", "Sample animated values at the rate below: exact curve shape in game")],
+            default="KEYS")
+        track_rate: FloatProperty(name="Bake keys / sec", default=10.0, min=0.5, max=120.0)
+        set_current: BoolProperty(name="Make it the active scene", default=True,
+                                  description="Set CurrentSceneId in the file to the exported scene")
+        backup: BoolProperty(name="Backup before overwrite", default=True,
+                             description="Copy the existing file into a 'backup' folder next to it first")
 
     # ------------------------------------------------------------ export core
 
@@ -618,11 +795,400 @@ if HAVE_BPY:
                 scene.render.fps_base = scene.render.fps / to_fps
         scene.rust_shot_export.authored_fps = to_fps
 
+    # ------------------------------------------------------------ demo controls: Blender side
+
+    # controls that live on the Blender camera itself; everything else is a custom property on the object
+    NATIVE_CONTROLS = {
+        "camera.fov": "lens",
+        "camera.focusdistance": "dof.focus_distance",
+        "camera.aperture": "dof.aperture_fstop",
+        "dof.enabled": "dof.use_dof",
+    }
+    STEP_KINDS = ("bool",)  # always constant (on/off)
+
+    def _vertical_fov(scene, cd):
+        if cd.sensor_fit == "VERTICAL":
+            return math.degrees(cd.angle_y)
+        r = scene.render
+        aspect = (r.resolution_x * r.pixel_aspect_x) / (r.resolution_y * r.pixel_aspect_y)
+        return math.degrees(2 * math.atan(math.tan(cd.angle_x / 2) / aspect))
+
+    def _native_get(scene, obj, cid):
+        cd = obj.data
+        if cid == "camera.fov":
+            return _vertical_fov(scene, cd)
+        if cid == "camera.focusdistance":
+            if cd.dof.focus_object is not None:
+                mw = obj.matrix_world
+                fwd = -mw.col[2].xyz.normalized()
+                return (cd.dof.focus_object.matrix_world.translation - mw.translation).dot(fwd)
+            return cd.dof.focus_distance
+        if cid == "camera.aperture":
+            return cd.dof.aperture_fstop
+        if cid == "dof.enabled":
+            return 1.0 if cd.dof.use_dof else 0.0
+
+    def _native_set_key(obj, cid, value, frame=None):
+        cd = obj.data
+        if cid == "camera.fov":
+            cd.sensor_fit = "VERTICAL"
+            cd.angle_y = math.radians(max(1.0, min(179.0, value)))
+            idb, path = cd, "lens"
+        elif cid == "camera.focusdistance":
+            cd.dof.focus_distance = max(0.0, value)
+            idb, path = cd, "dof.focus_distance"
+        elif cid == "camera.aperture":
+            cd.dof.aperture_fstop = max(0.1, value)
+            idb, path = cd, "dof.aperture_fstop"
+        else:  # dof.enabled
+            cd.dof.use_dof = value >= 0.5
+            idb, path = cd, "dof.use_dof"
+        if frame is not None:
+            idb.keyframe_insert(path, frame=frame)
+        return idb, path
+
+    def _custom_path(cid):
+        return '["%s"]' % cid
+
+    def _ensure_custom(obj, cid, value=None):
+        label, default, lo, hi, kind = CONTROL_INFO.get(cid, (cid, 0.0, -1e6, 1e6, "float"))
+        if cid not in obj.keys():
+            obj[cid] = float(default if value is None else value)
+            try:
+                ui = obj.id_properties_ui(cid)
+                ui.update(min=-1e9, max=1e9, soft_min=lo, soft_max=hi, description=label,
+                          step=100 if kind in ("int", "weather", "bool") else 10)
+            except Exception:
+                pass
+        elif value is not None:
+            obj[cid] = float(value)
+
+    def _control_ids(obj):
+        try:
+            return list(json.loads(obj.rust_shot.controls or "[]"))
+        except Exception:
+            return []
+
+    def _set_control_ids(obj, ids):
+        obj.rust_shot.controls = json.dumps(sorted(set(ids)))
+
+    def _fcurve(idb, path):
+        ad = getattr(idb, "animation_data", None)
+        if not ad or not ad.action:
+            return None
+        for fc in _iter_fcurves(ad.action):
+            if fc.data_path == path:
+                return fc
+        return None
+
+    def _control_fcurve(obj, cid):
+        if cid in NATIVE_CONTROLS:
+            return _fcurve(obj.data, NATIVE_CONTROLS[cid])
+        return _fcurve(obj, _custom_path(cid))
+
+    def _apply_easing(fc, easings, kind):
+        """Set Blender interpolation/handles from game Easing values (one per key, same order)."""
+        pts = sorted(fc.keyframe_points, key=lambda k: k.co.x)
+        for i, kp in enumerate(pts):
+            e = easings[i] if i < len(easings) else 0
+            mode = EASING_NAMES[e] if 0 <= e < len(EASING_NAMES) else "SMOOTH"
+            if kind in STEP_KINDS or mode == "STEP":
+                kp.interpolation = "CONSTANT"
+            elif mode == "LINEAR":
+                kp.interpolation = "LINEAR"
+            else:
+                kp.interpolation = "BEZIER"
+                kp.handle_left_type = kp.handle_right_type = "AUTO_CLAMPED"
+        fc.update()
+        pts = sorted(fc.keyframe_points, key=lambda k: k.co.x)  # update() reallocates: old refs are stale
+        for i, kp in enumerate(pts):  # FLAT / BROKEN need final auto positions first
+            e = easings[i] if i < len(easings) else 0
+            mode = EASING_NAMES[e] if 0 <= e < len(EASING_NAMES) else "SMOOTH"
+            if kp.interpolation != "BEZIER" or mode not in ("FLAT", "BROKEN"):
+                continue
+            kp.handle_left_type = kp.handle_right_type = "ALIGNED" if mode == "FLAT" else "FREE"
+            if mode == "FLAT":
+                x, y = kp.co
+                dl = (x - pts[i - 1].co.x) / 3 if i > 0 else 1.0
+                dr = (pts[i + 1].co.x - x) / 3 if i + 1 < len(pts) else 1.0
+                kp.handle_left = (x - dl, y)
+                kp.handle_right = (x + dr, y)
+        fc.update()
+
+    def _easing_of(kp):
+        if kp.interpolation == "CONSTANT":
+            return EASING_NAMES.index("STEP")
+        if kp.interpolation == "LINEAR":
+            return EASING_NAMES.index("LINEAR")
+        if kp.interpolation == "BEZIER":
+            types = {kp.handle_left_type, kp.handle_right_type}
+            if types <= {"AUTO", "AUTO_CLAMPED"}:
+                return EASING_NAMES.index("SMOOTH")
+            if types == {"VECTOR"}:
+                return EASING_NAMES.index("LINEAR")
+            if "FREE" in types or "VECTOR" in types:  # independent tangents
+                return EASING_NAMES.index("BROKEN")
+            y = kp.co.y  # ALIGNED
+            if abs(kp.handle_left.y - y) < 1e-6 and abs(kp.handle_right.y - y) < 1e-6:
+                return EASING_NAMES.index("FLAT")
+            return EASING_NAMES.index("SMOOTH")
+        return EASING_NAMES.index("SMOOTH")  # elastic, bounce, ... -> use Bake for exact shape
+
+    def import_controls(context, path, which="CURRENT", set_fps=0):
+        """Create one animated camera per scene of a .demo-controls.json file."""
+        import os
+        data = controls_load(path)
+        scenes_ = data.get("Scenes") or []
+        if which == "CURRENT":
+            cur = controls_current_scene(data)
+            scenes_ = [cur] if cur else []
+        if not scenes_:
+            raise RuntimeError("No scenes in this file")
+        scene = context.scene
+        if set_fps:
+            scene.render.fps = int(set_fps)
+            scene.render.fps_base = 1.0
+        fps = _scene_fps(scene)
+        scene.rust_shot_export.authored_fps = fps
+        scene.rust_shot_export.fmt = "CONTROLS"
+        f0 = scene.frame_start
+        cams = []
+        last_t = 0.0
+        for sc in scenes_:
+            d = sc.get("Data", {})
+            name = sc.get("Name") or "Rust scene"
+            cam_data = bpy.data.cameras.new(name)
+            cam_data.sensor_fit = "VERTICAL"
+            cam_data.clip_end = 5000.0
+            cam = bpy.data.objects.new(name, cam_data)
+            context.collection.objects.link(cam)
+            cam.rotation_mode = "QUATERNION"
+            rs = cam.rust_shot
+            rs.controls_file = path
+            rs.scene_name = name
+            rs.scene_id = sc.get("Id", "")
+            rs.demo = "demos/" + os.path.basename(path).replace(".demo-controls.json", ".dem")
+            rs.start = 0.0
+            cp = d.get("CameraPath") or {}
+            rs.path_algorithm = int(cp.get("Algorithm", 1))
+
+            # camera path
+            prev_q = None
+            for k in cp.get("Transform") or []:
+                t = float(k.get("Time", 0.0))
+                last_t = max(last_t, t)
+                loc, m = unity_to_blender((k.get("Px", 0.0), k.get("Py", 0.0), k.get("Pz", 0.0)),
+                                          (k.get("Qx", 0.0), k.get("Qy", 0.0), k.get("Qz", 0.0), k.get("Qw", 1.0)))
+                q = mathutils.Matrix(m).to_quaternion()
+                if prev_q is not None and prev_q.dot(q) < 0:
+                    q.negate()
+                prev_q = q
+                cam.location = loc
+                cam.rotation_quaternion = q
+                cam.keyframe_insert("location", frame=f0 + t * fps)
+                cam.keyframe_insert("rotation_quaternion", frame=f0 + t * fps)
+                rs.path_focal = float(k.get("Focal", rs.path_focal))
+
+            # base values
+            ids = []
+            for p in d.get("Properties") or []:
+                cid, v = p.get("Id"), float(p.get("Value", 0.0))
+                if cid in NATIVE_CONTROLS:
+                    _native_set_key(cam, cid, v)
+                else:
+                    _ensure_custom(cam, cid, v)
+                ids.append(cid)
+
+            # animated tracks
+            for tr in d.get("Tracks") or []:
+                cid = tr.get("Id")
+                keys = sorted(tr.get("Keyframes") or [], key=lambda k: k.get("Time", 0.0))
+                if not cid or not keys:
+                    continue
+                kind = CONTROL_INFO.get(cid, ("", 0, 0, 0, "float"))[4]
+                for k in keys:
+                    t = float(k.get("Time", 0.0))
+                    last_t = max(last_t, t)
+                    v = float(k.get("Value", 0.0))
+                    if cid in NATIVE_CONTROLS:
+                        _native_set_key(cam, cid, v, frame=f0 + t * fps)
+                    else:
+                        _ensure_custom(cam, cid, v)
+                        cam.keyframe_insert(_custom_path(cid), frame=f0 + t * fps)
+                fc = _control_fcurve(cam, cid)
+                if fc:
+                    _apply_easing(fc, [int(k.get("Easing", 0)) for k in keys], kind)
+                ids.append(cid)
+            _set_control_ids(cam, [i for i in ids if i not in NATIVE_CONTROLS])
+            cams.append(cam)
+
+        scene.frame_end = max(scene.frame_end, int(math.ceil(f0 + last_t * fps)))
+        scene.camera = cams[0]
+        for o in context.selected_objects:
+            o.select_set(False)
+        for c in cams:
+            c.select_set(True)
+        context.view_layer.objects.active = cams[0]
+        return cams
+
+    def _track_keys(context, obj, cid, fc, mode, rate, speed, fps, f0, f1, t_of):
+        """Keyframes of one control for the game: [(time, value, easing)]."""
+        scene = context.scene
+        native = cid in NATIVE_CONTROLS
+        kind = CONTROL_INFO.get(cid, ("", 0, 0, 0, "float"))[4]
+
+        def value_at(frame):
+            fi = int(math.floor(frame))
+            scene.frame_set(fi, subframe=frame - fi)
+            v = _native_get(scene, obj, cid) if native else float(obj.get(cid, 0.0))
+            return float(v)
+
+        pts = sorted(fc.keyframe_points, key=lambda k: k.co.x) if fc else []
+        out = []
+        steps = []  # (frame_of_next_key, frame_of_this_key) for constant segments
+        for i, kp in enumerate(pts):
+            if (kp.interpolation == "CONSTANT" or kind in STEP_KINDS) and i + 1 < len(pts):
+                steps.append((pts[i + 1].co.x, kp.co.x))
+        if mode == "KEYS" and pts:
+            for kp in pts:
+                fr = min(max(kp.co.x, f0), f1)
+                e = EASING_NAMES.index("STEP") if kind in STEP_KINDS else _easing_of(kp)
+                out.append((t_of(fr), value_at(fr), e))
+        else:
+            n = int(math.floor((f1 - f0) / fps / speed * rate + 1e-6)) + 1
+            frames = {f0 + i / rate * speed * fps for i in range(n)} | {f1}
+            frames |= {kp.co.x for kp in pts if f0 <= kp.co.x <= f1}
+            for fr in sorted(frames):
+                out.append((t_of(fr), value_at(fr), EASING_NAMES.index("LINEAR")))
+        # constant segments: hold the old value until just before the jump (survives game smoothing)
+        eps = 0.001
+        for nxt, this in steps:
+            if not (f0 < nxt <= f1):
+                continue
+            t_jump = t_of(nxt)
+            v_old = value_at(max(this, f0))
+            out = [k for k in out if not (t_jump - eps * 1.5 < k[0] < t_jump)]
+            out.append((t_jump - eps, v_old, EASING_NAMES.index("STEP")))
+        out.sort(key=lambda k: k[0])
+        return [{"Time": float(t), "Value": float(v), "Easing": int(e)} for t, v, e in out]
+
+    def export_controls(context, obj, path, s, scene_name=None):
+        import os
+        scene = context.scene
+        rs = obj.rust_shot
+        f0, f1, fps, dur, _ = shot_timing(scene, s, obj)
+
+        def t_of(frame):
+            return rs.start + (frame - f0) / fps / s.speed
+
+        cur = scene.frame_current
+        # camera path
+        n = int(math.floor(dur * s.path_rate + 1e-6)) + 1
+        frames = [f0 + i / s.path_rate * s.speed * fps for i in range(n)]
+        if f1 - frames[-1] > 1e-3:
+            frames.append(f1)
+        transform = []
+        prev = None
+        for fr in frames:
+            fi = int(math.floor(fr))
+            scene.frame_set(fi, subframe=fr - fi)
+            mw = obj.matrix_world
+            p, q = blender_to_unity(tuple(mw.to_translation()), [list(r) for r in mw.to_3x3().normalized()])
+            if prev is not None and sum(a * b for a, b in zip(prev, q)) < 0:
+                q = tuple(-c for c in q)
+            prev = q
+            transform.append({"Time": float(t_of(fr)), "Px": p[0], "Py": p[1], "Pz": p[2],
+                              "Qx": q[0], "Qy": q[1], "Qz": q[2], "Qw": q[3], "Focal": float(rs.path_focal)})
+
+        # controls on this camera
+        ids = set(_control_ids(obj)) | {k for k in obj.keys() if k in CONTROL_INFO} | set(NATIVE_CONTROLS)
+        tracks = {}
+        for cid in sorted(ids):
+            fc = _control_fcurve(obj, cid)
+            mode = s.track_mode
+            if cid == "camera.focusdistance" and obj.data.dof.focus_object is not None:
+                fc, mode = None, "BAKE"  # follows an object: has to be sampled
+            elif fc is None or len(fc.keyframe_points) < 2:
+                continue
+            tracks[cid] = _track_keys(context, obj, cid, fc, mode, s.track_rate, s.speed, fps, f0, f1, t_of)
+
+        scene.frame_set(int(f0))
+        props = {}
+        for cid in ids:
+            if cid in tracks:
+                continue  # animated: the game keeps its own base value, filled in below
+            if cid in NATIVE_CONTROLS:
+                props[cid] = float(_native_get(scene, obj, cid))
+            elif cid in obj.keys():
+                props[cid] = float(obj[cid])
+        scene.frame_set(cur)
+
+        # merge into the file
+        data = controls_load(path) if os.path.exists(path) else controls_new_file()
+        name = scene_name or rs.scene_name or obj.name
+        sc = controls_find_scene(data, name=name, scene_id=rs.scene_id)
+        if sc is None:
+            sc = controls_new_scene(name, end_time=transform[-1]["Time"] if transform else 0.0)
+            data.setdefault("Scenes", []).append(sc)
+        sc["Name"] = name
+        dd = sc.setdefault("Data", {})
+        dd.setdefault("Version", 2)
+        old_props = {p.get("Id"): p.get("Value") for p in dd.get("Properties") or []}
+        old_props.update(props)
+        for cid, keys in tracks.items():  # new animated control: base = its last key
+            old_props.setdefault(cid, keys[-1]["Value"] if keys else 0.0)
+        dd["Properties"] = [{"Id": k, "Value": float(old_props[k])} for k in sorted(old_props)]
+        order = [t.get("Id") for t in dd.get("Tracks") or [] if t.get("Id") in tracks]
+        order += [k for k in sorted(tracks) if k not in order]
+        dd["Tracks"] = [{"Id": k, "Keyframes": tracks[k]} for k in order]
+        dd["CameraPath"] = {"Algorithm": int(rs.path_algorithm), "Transform": transform}
+        for k, v in (("Clones", []), ("Lights", []), ("HasExportRange", False), ("ExportStart", 0.0)):
+            dd.setdefault(k, v)
+        dd.setdefault("ExportEnd", float(transform[-1]["Time"]) if transform else 0.0)
+        # keep Json.NET's key order: Version, Properties, Tracks, CameraPath, Clones, Lights, ...
+        key_order = ["Version", "Properties", "Tracks", "CameraPath", "Clones", "Lights",
+                     "HasExportRange", "ExportStart", "ExportEnd"]
+        sc["Data"] = {k: dd[k] for k in key_order if k in dd} | {k: v for k, v in dd.items() if k not in key_order}
+        if s.set_current or not data.get("CurrentSceneId"):
+            data["CurrentSceneId"] = sc["Id"]
+        backup_dir = os.path.join(os.path.dirname(path), "backup") if s.backup else None
+        controls_save(data, path, backup_dir)
+        rs.scene_id = sc["Id"]
+        rs.scene_name = name
+        return dur, len(transform), len(tracks)
+
+    def run_export_controls(op, context, base_path=None):
+        import os
+        s = context.scene.rust_shot_export
+        cams = get_export_cameras(context, s)
+        if not cams:
+            op.report({"ERROR"}, "No camera to export (check the Camera setting)")
+            return {"CANCELLED"}
+        done = []
+        for cam in cams:
+            path = base_path or bpy.path.abspath(cam.rust_shot.controls_file)
+            if not path:
+                op.report({"ERROR"}, "%s: set the Controls file "
+                                     "(demos/controls/<demo>.demo-controls.json)" % cam.name)
+                return {"CANCELLED"}
+            if not os.path.isdir(os.path.dirname(path) or "."):
+                op.report({"ERROR"}, "Folder does not exist: %s" % os.path.dirname(path))
+                return {"CANCELLED"}
+            if base_path:
+                cam.rust_shot.controls_file = path
+            dur, n_path, n_tr = export_controls(context, cam, path, s)
+            done.append("%s (%.2fs, %d path keys, %d tracks)" % (cam.rust_shot.scene_name, dur, n_path, n_tr))
+        op.report({"INFO"}, "Exported: " + ", ".join(done))
+        return {"FINISHED"}
+
     # ------------------------------------------------------------ operators
 
     def _draw_export_settings(layout, context, compact=False):
         s = context.scene.rust_shot_export
         scene = context.scene
+        controls = s.fmt == "CONTROLS"
+        if not compact:
+            layout.prop(s, "fmt", text="")
         col = layout.column(align=True)
         col.prop(s, "camera_mode")
         if s.camera_mode == "PICK":
@@ -643,18 +1209,72 @@ if HAVE_BPY:
         if s.time_base == "CUSTOM":
             col.prop(s, "custom_fps")
         col.prop(s, "speed")
-        col.prop(s, "sample_rate")
+        if controls:
+            col.prop(s, "path_rate")
+            col.prop(s, "track_mode")
+            if s.track_mode == "BAKE":
+                col.prop(s, "track_rate")
+        else:
+            col.prop(s, "sample_rate")
         if cams:
             f0, f1, fps, dur, n = shot_timing(scene, s, cams[0])
             box = layout.box()
             box.label(text="Frames %d–%d @ %.3g fps" % (f0, f1, fps))
-            box.label(text="In game: %.2f s, %d keys" % (dur, n), icon="TIME")
+            if controls:
+                t0 = cams[0].rust_shot.start
+                box.label(text="Demo time %.2f – %.2f s, %d path keys"
+                               % (t0, t0 + dur, int(dur * s.path_rate) + 1), icon="TIME")
+            else:
+                box.label(text="In game: %.2f s, %d keys" % (dur, n), icon="TIME")
 
         col = layout.column(align=True)
-        col.prop(s, "fov_mode")
-        if s.fov_mode == "CONSTANT":
-            col.prop(s, "fov_value")
-        col.prop(s, "dof_mode")
+        if controls:
+            col.prop(s, "set_current")
+            col.prop(s, "backup")
+        else:
+            col.prop(s, "fov_mode")
+            if s.fov_mode == "CONSTANT":
+                col.prop(s, "fov_value")
+            col.prop(s, "dof_mode")
+
+    def _draw_controls(layout, obj):
+        """Per-camera demo controls: native camera settings + custom animatable properties."""
+        cd = obj.data
+        rs = obj.rust_shot
+        col = layout.column(align=True)
+        col.prop(rs, "controls_file", text="File")
+        col.prop(rs, "scene_name")
+        col.prop(rs, "start", text="Demo time at start")
+        ids = [i for i in _control_ids(obj) if i in obj.keys()]
+        ids += [k for k in obj.keys() if k in CONTROL_INFO and k not in ids]
+        for prefix, title in CONTROL_GROUPS:
+            box = layout.box()
+            box.label(text=title)
+            c = box.column(align=True)
+            if prefix == "camera":
+                c.prop(cd, "angle", text="FOV")
+                c.prop(cd.dof, "focus_object")
+                c.prop(cd.dof, "focus_distance", text="Focus distance")
+                c.prop(cd.dof, "aperture_fstop", text="Aperture")
+            if prefix == "dof":
+                c.prop(cd.dof, "use_dof", text="DOF enabled")
+            for cid in sorted(i for i in ids if i.split(".")[0] == prefix and i not in NATIVE_CONTROLS):
+                label, _, _, _, kind = CONTROL_INFO.get(cid, (cid, 0, 0, 0, "float"))
+                row = c.row(align=True)
+                row.prop(obj, _custom_path(cid), text=label)
+                if kind == "weather":
+                    w = int(round(float(obj.get(cid, 0.0))))
+                    row.label(text=WEATHER_NAMES[w] if 0 <= w < len(WEATHER_NAMES) else "?")
+                op = row.operator(RUSTSHOT_OT_remove_control.bl_idname, text="", icon="X")
+                op.cid = cid
+        other = sorted(i for i in ids if i.split(".")[0] not in dict(CONTROL_GROUPS) and i not in NATIVE_CONTROLS)
+        if other:
+            box = layout.box()
+            box.label(text="Other")
+            for cid in other:
+                box.prop(obj, _custom_path(cid), text=cid)
+        layout.menu(RUSTSHOT_MT_add_control.bl_idname, icon="ADD")
+        layout.label(text="Hover a value and press I to keyframe it", icon="INFO")
 
     class IMPORT_OT_rust_shot(bpy.types.Operator, ImportHelper):
         """Import a Rust demo camera shot as an animated camera"""
@@ -699,6 +1319,8 @@ if HAVE_BPY:
         bl_label = "Export to Shots folder"
 
         def execute(self, context):
+            if context.scene.rust_shot_export.fmt == "CONTROLS":
+                return run_export_controls(self, context, None)
             return run_export(self, context, None)
 
     class RUSTSHOT_OT_change_fps(bpy.types.Operator):
@@ -733,6 +1355,109 @@ if HAVE_BPY:
             context.scene.rust_shot_export.authored_fps = _scene_fps(context.scene)
             return {"FINISHED"}
 
+    class IMPORT_OT_rust_controls(bpy.types.Operator, ImportHelper):
+        """Import scenes of a Rust demo controls file (demos/controls/*.demo-controls.json) as animated cameras"""
+        bl_idname = "import_scene.rust_controls"
+        bl_label = "Import Rust demo controls"
+        bl_options = {"REGISTER", "UNDO"}
+        filename_ext = ".json"
+        filter_glob: StringProperty(default="*.demo-controls.json;*.json", options={"HIDDEN"})
+        which: EnumProperty(
+            name="Scenes",
+            items=[("CURRENT", "Active scene", "Only the scene that is active in the file"),
+                   ("ALL", "All scenes", "One camera per scene")],
+            default="CURRENT")
+        set_fps: EnumProperty(
+            name="Scene FPS",
+            items=[("0", "Keep current", ""), ("24", "24", ""), ("30", "30", ""),
+                   ("50", "50", ""), ("60", "60", ""), ("120", "120", "")],
+            default="60",
+            description="Keys are placed so real-time speed is preserved at this FPS")
+
+        def execute(self, context):
+            try:
+                cams = import_controls(context, self.filepath, self.which, int(self.set_fps))
+            except (RuntimeError, ValueError, KeyError) as e:
+                self.report({"ERROR"}, str(e))
+                return {"CANCELLED"}
+            self.report({"INFO"}, "Imported: " + ", ".join(c.name for c in cams))
+            return {"FINISHED"}
+
+    class EXPORT_OT_rust_controls(bpy.types.Operator, ExportHelper):
+        """Write the camera animation into a Rust demo controls file (other scenes in the file are kept)"""
+        bl_idname = "export_scene.rust_controls"
+        bl_label = "Export Rust demo controls"
+        filename_ext = ".json"
+        check_extension = False
+        filter_glob: StringProperty(default="*.demo-controls.json;*.json", options={"HIDDEN"})
+
+        def invoke(self, context, event):
+            cams = get_export_cameras(context, context.scene.rust_shot_export)
+            if cams and cams[0].rust_shot.controls_file:
+                self.filepath = bpy.path.abspath(cams[0].rust_shot.controls_file)
+            else:
+                self.filepath = "mydemo.demo-controls.json"
+            return ExportHelper.invoke(self, context, event)
+
+        def draw(self, context):
+            _draw_export_settings(self.layout, context, compact=True)
+
+        def execute(self, context):
+            return run_export_controls(self, context, self.filepath)
+
+    class RUSTSHOT_OT_add_control(bpy.types.Operator):
+        """Add an animatable demo control to the active camera"""
+        bl_idname = "rust_shot.add_control"
+        bl_label = "Add control"
+        bl_options = {"REGISTER", "UNDO"}
+        cid: StringProperty()
+
+        def execute(self, context):
+            ob = context.active_object
+            if not ob or ob.type != "CAMERA" or not self.cid:
+                return {"CANCELLED"}
+            _ensure_custom(ob, self.cid)
+            _set_control_ids(ob, _control_ids(ob) + [self.cid])
+            return {"FINISHED"}
+
+    class RUSTSHOT_OT_remove_control(bpy.types.Operator):
+        """Remove this control (and its animation) from the camera"""
+        bl_idname = "rust_shot.remove_control"
+        bl_label = "Remove control"
+        bl_options = {"REGISTER", "UNDO"}
+        cid: StringProperty()
+
+        def execute(self, context):
+            ob = context.active_object
+            if not ob or self.cid not in ob.keys():
+                return {"CANCELLED"}
+            fc = _fcurve(ob, _custom_path(self.cid))
+            if fc:
+                try:
+                    ob.keyframe_delete(_custom_path(self.cid))
+                except Exception:
+                    pass
+                fc = _fcurve(ob, _custom_path(self.cid))
+                if fc:
+                    for kp in list(fc.keyframe_points)[::-1]:
+                        fc.keyframe_points.remove(kp)
+            del ob[self.cid]
+            _set_control_ids(ob, [i for i in _control_ids(ob) if i != self.cid])
+            return {"FINISHED"}
+
+    class RUSTSHOT_MT_add_control(bpy.types.Menu):
+        bl_idname = "RUSTSHOT_MT_add_control"
+        bl_label = "Add control"
+
+        def draw(self, context):
+            ob = context.active_object
+            have = set(ob.keys()) if ob else set()
+            for prefix, title in CONTROL_GROUPS:
+                self.layout.label(text=title)
+                for cid, info in CONTROL_INFO.items():
+                    if cid.split(".")[0] == prefix and cid not in NATIVE_CONTROLS and cid not in have:
+                        self.layout.operator(RUSTSHOT_OT_add_control.bl_idname, text=info[0]).cid = cid
+
     # ------------------------------------------------------------ UI panel (N sidebar > Rust Shot)
 
     class VIEW3D_PT_rust_shot(bpy.types.Panel):
@@ -755,41 +1480,54 @@ if HAVE_BPY:
                 box.operator(RUSTSHOT_OT_change_fps.bl_idname, text="Rescale keys (keep speed)")
                 box.operator(RUSTSHOT_OT_mark_fps.bl_idname)
 
-            layout.operator(IMPORT_OT_rust_shot.bl_idname, icon="IMPORT")
+            row = layout.row(align=True)
+            row.operator(IMPORT_OT_rust_controls.bl_idname, text="Import controls", icon="IMPORT")
+            row.operator(IMPORT_OT_rust_shot.bl_idname, text="Import .shot", icon="IMPORT")
+            layout.prop(s, "fmt", text="Format")
 
             ob = context.active_object
             if ob and ob.type == "CAMERA":
                 box = layout.box()
                 box.label(text=ob.name, icon="CAMERA_DATA")
                 rs = ob.rust_shot
-                box.prop(rs, "demo")
-                box.prop(rs, "folder")
-                box.prop(rs, "start")
-                if ob.data.dof.use_dof:
-                    box.prop(ob.data.dof, "focus_object")
-                    box.prop(ob.data.dof, "focus_distance")
-                    box.prop(ob.data.dof, "aperture_fstop", text="DOF aper")
-                    box.prop(rs, "dof_blur")
+                if s.fmt == "CONTROLS":
+                    _draw_controls(box, ob)
                 else:
-                    box.prop(ob.data.dof, "use_dof", text="Depth of Field")
+                    box.prop(rs, "demo")
+                    box.prop(rs, "folder")
+                    box.prop(rs, "start")
+                    if ob.data.dof.use_dof:
+                        box.prop(ob.data.dof, "focus_object")
+                        box.prop(ob.data.dof, "focus_distance")
+                        box.prop(ob.data.dof, "aperture_fstop", text="DOF aper")
+                        box.prop(rs, "dof_blur")
+                    else:
+                        box.prop(ob.data.dof, "use_dof", text="Depth of Field")
 
             layout.separator()
             layout.label(text="Export", icon="EXPORT")
-            _draw_export_settings(layout, context)
+            _draw_export_settings(layout, context, compact=True)
             col = layout.column(align=True)
-            col.prop(s, "directory")
-            col.prop(s, "file_name")
-            col.operator(RUSTSHOT_OT_quick_export.bl_idname, icon="EXPORT")
+            if s.fmt == "CONTROLS":
+                col.operator(RUSTSHOT_OT_quick_export.bl_idname, text="Export to controls file", icon="EXPORT")
+            else:
+                col.prop(s, "directory")
+                col.prop(s, "file_name")
+                col.operator(RUSTSHOT_OT_quick_export.bl_idname, icon="EXPORT")
             layout.operator(RUSTSHOT_OT_change_fps.bl_idname, icon="TIME")
 
     def _menu_import(self, context):
+        self.layout.operator(IMPORT_OT_rust_controls.bl_idname, text="Rust demo controls (.json)")
         self.layout.operator(IMPORT_OT_rust_shot.bl_idname, text="Rust camera shot (.shot)")
 
     def _menu_export(self, context):
+        self.layout.operator(EXPORT_OT_rust_controls.bl_idname, text="Rust demo controls (.json)")
         self.layout.operator(EXPORT_OT_rust_shot.bl_idname, text="Rust camera shot (.shot)")
 
     _classes = (RustShotCamera, RustShotExport, IMPORT_OT_rust_shot, EXPORT_OT_rust_shot,
+                IMPORT_OT_rust_controls, EXPORT_OT_rust_controls,
                 RUSTSHOT_OT_quick_export, RUSTSHOT_OT_change_fps, RUSTSHOT_OT_mark_fps,
+                RUSTSHOT_OT_add_control, RUSTSHOT_OT_remove_control, RUSTSHOT_MT_add_control,
                 VIEW3D_PT_rust_shot)
 
     def register():
