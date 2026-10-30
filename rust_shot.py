@@ -45,7 +45,7 @@ import sys
 bl_info = {
     "name": "Rust camera shot (.shot)",
     "author": "haos9cr",
-    "version": (0, 4, 0),
+    "version": (0, 4, 1),
     "blender": (3, 0, 0),
     "location": "File > Import/Export",
     "description": "Import/export Rust demo camera paths and controls (.demo-controls.json, .shot)",
@@ -309,6 +309,7 @@ CONTROL_INFO = {
     "camera.dofblur":        ("DOF blur", 16.0, 0.0, 100.0, "float"),
     "camera.roll":           ("Roll", 0.0, -360.0, 360.0, "float"),
     "camera.cinematicshake": ("Cinematic shake", 0.0, 0.0, 10.0, "float"),
+    "camera.smoothing":      ("Smoothing", 0.0, 0.0, 10.0, "float"),
     "dof.enabled":           ("DOF enabled", 0.0, 0.0, 1.0, "bool"),
     "dof.mode":              ("DOF mode", 0.0, 0.0, 10.0, "int"),
     "dof.quality":           ("DOF quality", 0.0, 0.0, 10.0, "int"),
