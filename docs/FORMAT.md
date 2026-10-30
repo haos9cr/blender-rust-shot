@@ -40,7 +40,7 @@ Known control ids:
 
 | Group | Ids |
 |---|---|
-| camera | `fov` (overrides FOV, degrees), `focallength`, `focusdistance`, `aperture`, `dofblur`, `roll`, `cinematicshake` |
+| camera | `fov` (overrides FOV, degrees), `focallength`, `focusdistance`, `aperture`, `dofblur`, `roll`, `cinematicshake`, `smoothing` |
 | dof | `enabled` (0/1), `mode`, `quality`, `focustime`, `barrel`, `squeeze`, `debug` |
 | env | `timeofday` (hours), `sunrotation` (degrees), `weather` (0 Clear, 1 Overcast, 2 Rain, 3 Storm, 4 Snow), `clouds`, `fog`, `wind` |
 | fx | `ao`, `bloom`, `chromatic`, `filmgrain`, `lensdirt`, `motionblur`, `screenvignette`, `shafts`, `sharpen`, `vignette` |

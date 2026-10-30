@@ -172,9 +172,14 @@ plus keyframe tracks for position, rotation (quaternion), FOV and optional DOF.
 
 ## Samples
 
-`samples/test_orbit.shot` is a 10-second orbit around the origin made in Blender with this add-on and
-confirmed to play back in game. Record your own shots with the debug camera and drop them into `samples/`;
-`tests/test_roundtrip.py` checks every file there.
+| File | What it is |
+|---|---|
+| `samples/advanced_camera_animation.dem` | The demo from the example video (player name and Steam ID anonymised) |
+| `samples/advanced_camera_animation.demo-controls.json` | The camera of the example as a demo controls file |
+| `samples/test_orbit.shot` | A 10-second orbit around the origin made in Blender, in the legacy `.shot` format |
+
+To play the example in game, copy the `.dem` into `Rust\demos\` and the `.demo-controls.json` into
+`Rust\demos\controls\`, then open the demo. `tests/test_roundtrip.py` checks every sample file.
 
 ## Known limitations
 
